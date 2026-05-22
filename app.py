@@ -15,9 +15,7 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================================
 
-APP_PASSWORD = "vera2026"
-
-# Colorado colors
+APP_# Colorado colors
 CO_BLUE = "#002868"   # Colorado blue
 CO_RED = "#C8102E"    # Colorado red
 CO_GOLD = "#CFB87C"   # Colorado gold/tan
@@ -632,9 +630,6 @@ def main():
         }}
     </style>
     """, unsafe_allow_html=True)
-
-    if not check_password():
-        return
 
     districts_df = load_districts()
     access_df = load_access_data()
