@@ -15,7 +15,7 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================================
 
-APP_# Colorado colors
+# Colorado colors
 CO_BLUE = "#002868"   # Colorado blue
 CO_RED = "#C8102E"    # Colorado red
 CO_GOLD = "#CFB87C"   # Colorado gold/tan
