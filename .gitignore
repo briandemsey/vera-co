@@ -1,0 +1,13 @@
+# dev-only helpers and outputs
+_*.py
+*.log
+*.png
+*.html
+localhost_test.html
+
+# python
+__pycache__/
+*.pyc
+
+# streamlit
+.streamlit/secrets.toml

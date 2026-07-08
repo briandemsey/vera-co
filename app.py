@@ -1,677 +1,632 @@
 """
 VERA-CO: Verification Engine for Results & Accountability - Colorado
-Type 4 Dyslexia Screening using ACCESS for ELLs and CMAS Assessment Data
+
+Real data from the Colorado Department of Education (CDE):
+  - CMAS (Colorado Measures of Academic Success) - district+school, all grades, all subjects
+  - ACCESS for ELLs summary - district+school+state, WIDA proficiency levels + redesignation
+  - DPF / SPF (District/School Performance Frameworks)
+  - Enrollment (IPST: SPED, EL, homeless, gifted, immigrant, migrant)
+  - Graduation and dropout rates
+  - Growth (Median Growth Percentiles)
 
 H-EDU.Solutions | https://h-edu.solutions
 """
 
-import streamlit as st
+import os
+import sqlite3
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+import streamlit as st
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Colorado colors
-CO_BLUE = "#002868"   # Colorado blue
-CO_RED = "#C8102E"    # Colorado red
-CO_GOLD = "#CFB87C"   # Colorado gold/tan
+CO_BLUE = "#002868"
+CO_RED  = "#C8102E"
+CO_GOLD = "#CFB87C"
+
+# Resolve DB path: same directory as app.py, or override via env var.
+DEFAULT_DB = Path(__file__).parent / "vera_co.sqlite"
+DB_PATH = Path(os.environ.get("VERA_CO_DB", DEFAULT_DB))
+
+# Local dev fallback: use the full warehouse on F: if the bundled DB is missing.
+if not DB_PATH.exists():
+    dev_db = Path(r"F:\VERA\vera-co\data\vera_co.sqlite")
+    if dev_db.exists():
+        DB_PATH = dev_db
+
 
 # ============================================================================
-# SAMPLE DATA - Colorado Districts
+# DATA ACCESS
 # ============================================================================
 
+@st.cache_resource
+def get_conn():
+    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
+
+
+@st.cache_data(ttl=3600)
 def load_districts():
-    """Load Colorado district data."""
-    districts_data = [
-        ("0880", "Denver Public Schools", 90000, 31500, 35.0, 74.2, 62.5),
-        ("0010", "Jefferson County R-1", 80000, 8800, 11.0, 86.3, 71.2),
-        ("0900", "Douglas County RE-1", 68000, 4760, 7.0, 92.5, 78.4),
-        ("0080", "Cherry Creek 5", 55000, 8250, 15.0, 88.7, 74.8),
-        ("0030", "Aurora Public Schools", 38000, 15200, 40.0, 71.5, 55.3),
-        ("0011", "Colorado Springs D-11", 24000, 3600, 15.0, 78.4, 61.7),
-        ("0500", "Adams 12 Five Star", 38000, 7600, 20.0, 82.1, 67.3),
-        ("0020", "Boulder Valley RE-2", 30000, 2700, 9.0, 89.8, 75.6),
-        ("2180", "Poudre R-1", 32000, 3840, 12.0, 85.6, 70.2),
-        ("1210", "Greeley-Evans 6", 23000, 9200, 40.0, 72.8, 54.8),
-    ]
+    """All Colorado districts with 2025 enrollment, EL count, SPF rating, and graduation rate."""
+    conn = get_conn()
 
-    df = pd.DataFrame(districts_data, columns=[
-        'district_id', 'district_name', 'total_students',
-        'ell_count', 'ell_percent', 'graduation_rate', 'spf_score'
-    ])
+    # Backbone: DPF for the full district list + 2025 rating and points
+    q = """
+    SELECT
+        d.district_code               AS district_id,
+        d.district_name,
+        d.region,
+        d.setting,
+        d.rating_2025_final           AS spf_rating,
+        d.points_2025                 AS spf_points,
+
+        e.pk12_count                  AS total_students,
+        e.el_count,
+        e.el_pct                      AS el_percent,
+        e.sped_count,
+        e.sped_pct,
+        e.homeless_count,
+        e.gt_count
+
+    FROM dpf_district d
+    LEFT JOIN (
+        SELECT district_code,
+               SUM(pk12_count)  AS pk12_count,
+               SUM(el_count)    AS el_count,
+               AVG(el_pct)      AS el_pct,
+               SUM(sped_count)  AS sped_count,
+               AVG(sped_pct)    AS sped_pct,
+               SUM(homeless_count) AS homeless_count,
+               SUM(gt_count)    AS gt_count
+        FROM enrollment_ipst_school
+        WHERE school_year = '2024-2025'
+        GROUP BY district_code
+    ) e ON e.district_code = d.district_code
+    ORDER BY d.district_name
+    """
+    df = pd.read_sql_query(q, conn)
+
+    # Convert EL/SPED percentages: CDE stores as decimals (0.271) or percentages depending on year
+    # For the 2024-2025 file they are decimals. Normalize to percent (0-100).
+    for col in ("el_percent", "sped_pct"):
+        if col in df.columns:
+            # If mean value looks like a fraction (<=1), scale up. Guard NaN.
+            m = df[col].dropna().mean() if df[col].notna().any() else 0
+            if m and m <= 1.5:
+                df[col] = df[col] * 100
+
+    # Latest available graduation rate per district
+    grad_q = """
+    SELECT district_code, all_grad_rate
+    FROM outcomes_grad_district
+    WHERE cohort_year IN ('2024-2025','2023-2024')
+      AND source_sheet LIKE '%District%'
+    """
+    grad = pd.read_sql_query(grad_q, conn)
+    # Parse '78.9%' -> 78.9
+    def _pct_to_float(x):
+        if x is None: return None
+        s = str(x).strip().replace('%','')
+        try: return float(s)
+        except: return None
+    grad["graduation_rate"] = grad["all_grad_rate"].apply(_pct_to_float)
+    grad_agg = grad.groupby("district_code", as_index=False)["graduation_rate"].max()
+    df = df.merge(grad_agg, left_on="district_id", right_on="district_code", how="left").drop(columns=["district_code"])
+
     return df
 
-def load_access_data():
-    """Load sample ACCESS for ELLs data (Colorado is a WIDA state)."""
-    access_data = []
 
-    districts = [
-        ("0880", "Denver Public Schools"),
-        ("0010", "Jefferson County R-1"),
-        ("0900", "Douglas County RE-1"),
-        ("0080", "Cherry Creek 5"),
-        ("0030", "Aurora Public Schools"),
-        ("0011", "Colorado Springs D-11"),
-        ("0500", "Adams 12 Five Star"),
-        ("0020", "Boulder Valley RE-2"),
-        ("2180", "Poudre R-1"),
-        ("1210", "Greeley-Evans 6"),
-    ]
-
-    for district_id, district_name in districts:
-        for grade in range(3, 9):
-            for year in [2024, 2025]:
-                # Generate realistic ACCESS scores (scale 100-600)
-                base_speaking = 340 + (grade * 8)
-                base_writing = 295 + (grade * 6)
-
-                # Add district-specific variation
-                if district_id == "0030":  # Aurora - high EL%, larger delta
-                    speaking_adj = 40
-                    writing_adj = -10
-                elif district_id == "1210":  # Greeley - high EL%
-                    speaking_adj = 38
-                    writing_adj = -8
-                elif district_id == "0880":  # Denver
-                    speaking_adj = 32
-                    writing_adj = -3
-                elif district_id in ["0900", "0020"]:  # Higher performing
-                    speaking_adj = 15
-                    writing_adj = 12
-                else:
-                    speaking_adj = 22
-                    writing_adj = 5
-
-                access_data.append({
-                    'district_id': district_id,
-                    'district_name': district_name,
-                    'grade': grade,
-                    'year': year,
-                    'total_tested': 250 + (grade * 20) if district_id in ["0880", "0030"] else 80 + (grade * 8),
-                    'listening_avg': base_speaking + speaking_adj - 5,
-                    'speaking_avg': base_speaking + speaking_adj,
-                    'reading_avg': base_writing + writing_adj + 15,
-                    'writing_avg': base_writing + writing_adj,
-                    'composite_avg': (base_speaking + speaking_adj + base_writing + writing_adj) / 2 + 22
-                })
-
-    return pd.DataFrame(access_data)
-
-def load_cmas_data():
-    """Load sample CMAS (Colorado Measures of Academic Success) data."""
-    cmas_data = []
-
-    districts = [
-        ("0880", "Denver Public Schools"),
-        ("0010", "Jefferson County R-1"),
-        ("0900", "Douglas County RE-1"),
-        ("0080", "Cherry Creek 5"),
-        ("0030", "Aurora Public Schools"),
-        ("0011", "Colorado Springs D-11"),
-        ("0500", "Adams 12 Five Star"),
-        ("0020", "Boulder Valley RE-2"),
-        ("2180", "Poudre R-1"),
-        ("1210", "Greeley-Evans 6"),
-    ]
-
-    for district_id, district_name in districts:
-        for grade in range(3, 9):
-            for year in [2024, 2025]:
-                for subject in ['ELA', 'Math']:
-                    # Generate realistic CMAS proficiency distributions
-                    if district_id in ["0900", "0020", "0080"]:  # Higher performing
-                        exceeded = 22 + (grade * 0.5)
-                        met = 35 + (grade * 0.3)
-                        approaching = 28 - (grade * 0.3)
-                        not_met = 15 - (grade * 0.5)
-                    elif district_id in ["0030", "1210"]:  # Lower performing
-                        exceeded = 8 + (grade * 0.3)
-                        met = 22 + (grade * 0.2)
-                        approaching = 38 - (grade * 0.2)
-                        not_met = 32 - (grade * 0.3)
-                    elif district_id == "0880":  # Denver - large urban
-                        exceeded = 14 + (grade * 0.4)
-                        met = 28 + (grade * 0.2)
-                        approaching = 32 - (grade * 0.2)
-                        not_met = 26 - (grade * 0.4)
-                    else:  # Average
-                        exceeded = 16 + (grade * 0.4)
-                        met = 30 + (grade * 0.2)
-                        approaching = 30 - (grade * 0.2)
-                        not_met = 24 - (grade * 0.4)
-
-                    cmas_data.append({
-                        'district_id': district_id,
-                        'district_name': district_name,
-                        'grade': grade,
-                        'subject': subject,
-                        'year': year,
-                        'total_tested': 2500 + (grade * 100) if district_id == "0880" else 600 + (grade * 40),
-                        'not_met_pct': max(5, not_met),
-                        'approaching_pct': max(10, approaching),
-                        'met_pct': min(45, met),
-                        'exceeded_pct': min(35, exceeded),
-                        'mean_scale_score': 725 + (met + exceeded) * 1.5
-                    })
-
-    return pd.DataFrame(cmas_data)
-
-# ============================================================================
-# AUTHENTICATION
-# ============================================================================
-
-# ============================================================================
-# TYPE 4 DETECTION
-# ============================================================================
-
-def compute_type4_analysis(access_df, district_id, grade, year):
+@st.cache_data(ttl=3600)
+def load_cmas_row(district_id: str, subject: str, grade: str):
+    """One row of CMAS results for a district+subject+grade."""
+    conn = get_conn()
+    q = """
+    SELECT district_name, content, grade, mean_scale_score, participation_rate,
+           pct_did_not_yet_meet, pct_partially_met, pct_approached, pct_met, pct_exceeded,
+           pct_met_or_exceeded, num_valid_scores, num_total_records
+    FROM cmas_district_school
+    WHERE level = 'DISTRICT'
+      AND district_code = ?
+      AND content       = ?
+      AND grade         = ?
     """
-    Compute Type 4 (oral-written delta) analysis for a district.
+    return pd.read_sql_query(q, conn, params=[district_id, subject, grade])
+
+
+@st.cache_data(ttl=3600)
+def load_cmas_all_grades(district_id: str, subject: str):
+    conn = get_conn()
+    q = """
+    SELECT grade, mean_scale_score, participation_rate, pct_met_or_exceeded, num_valid_scores
+    FROM cmas_district_school
+    WHERE level = 'DISTRICT' AND district_code = ? AND content = ?
+      AND grade IN ('03','04','05','06','07','08','All Grades')
+    ORDER BY grade
     """
-    filtered = access_df[
-        (access_df['district_id'] == district_id) &
-        (access_df['grade'] == grade) &
-        (access_df['year'] == year)
-    ]
+    return pd.read_sql_query(q, conn, params=[district_id, subject])
 
-    if filtered.empty:
-        return None
 
-    row = filtered.iloc[0]
+@st.cache_data(ttl=3600)
+def load_access_row(district_id: str, grade_cluster: str, school_year: str = "2024-2025"):
+    conn = get_conn()
+    q = """
+    SELECT district_name, grade_cluster, num_valid_scores, mean_scale_score,
+           num_level_1, pct_level_1,
+           num_level_2, pct_level_2,
+           num_level_3, pct_level_3,
+           num_level_4, pct_level_4,
+           num_level_5_6, pct_level_5_6,
+           num_redesignation_eligible, pct_redesignation_eligible
+    FROM assessment_access_summary
+    WHERE level = 'DISTRICT'
+      AND district_code = ?
+      AND grade_cluster = ?
+      AND school_year   = ?
+    """
+    return pd.read_sql_query(q, conn, params=[district_id, grade_cluster, school_year])
 
-    speaking = row['speaking_avg']
-    writing = row['writing_avg']
-    delta = speaking - writing
-    delta_normalized = delta / 5
-    flagged = delta_normalized > 8
 
-    return {
-        'district_id': district_id,
-        'district_name': row['district_name'],
-        'grade': grade,
-        'year': year,
-        'speaking_avg': speaking,
-        'writing_avg': writing,
-        'delta': delta,
-        'delta_normalized': delta_normalized,
-        'flagged': flagged,
-        'total_tested': row['total_tested'],
-        'estimated_flagged': int(row['total_tested'] * 0.15) if flagged else int(row['total_tested'] * 0.05)
-    }
+@st.cache_data(ttl=3600)
+def load_access_grade_clusters(district_id: str, school_year: str = "2024-2025"):
+    conn = get_conn()
+    q = """
+    SELECT DISTINCT grade_cluster
+    FROM assessment_access_summary
+    WHERE level='DISTRICT' AND district_code=? AND school_year=?
+    ORDER BY CASE grade_cluster
+        WHEN 'All Grades' THEN 0
+        WHEN 'K'          THEN 1
+        WHEN '1'          THEN 2
+        WHEN '2-3'        THEN 3
+        WHEN '4-5'        THEN 4
+        WHEN '6-8'        THEN 5
+        WHEN '9-12'       THEN 6
+        ELSE 7 END
+    """
+    return pd.read_sql_query(q, conn, params=[district_id, school_year])["grade_cluster"].tolist()
+
+
+@st.cache_data(ttl=3600)
+def available_access_years(district_id: str):
+    conn = get_conn()
+    q = """
+    SELECT DISTINCT school_year FROM assessment_access_summary
+    WHERE level='DISTRICT' AND district_code=?
+    ORDER BY school_year DESC
+    """
+    return pd.read_sql_query(q, conn, params=[district_id])["school_year"].tolist()
+
+
+@st.cache_data(ttl=3600)
+def state_ela_gap_by_grade():
+    """State-level CMAS ELA proficiency vs. state ACCESS Level 4+ percentage by grade.
+    Used as an anchor for the honest Type 4 discussion at state level."""
+    conn = get_conn()
+    q = """
+    SELECT grade, pct_met_or_exceeded
+    FROM cmas_district_school
+    WHERE level='STATE' AND content='English Language Arts'
+      AND grade IN ('03','04','05','06','07','08')
+    ORDER BY grade
+    """
+    return pd.read_sql_query(q, conn)
+
 
 # ============================================================================
-# DASHBOARD PAGES
+# PAGES
 # ============================================================================
 
-def render_overview(districts_df, access_df, cmas_df):
-    """Render the overview dashboard."""
+def render_overview(districts_df: pd.DataFrame):
     st.header("Colorado Education Overview")
+    st.caption(
+        "Data source: Colorado Department of Education public files (CMAS, DPF, IPST, graduation). "
+        "184 districts, 2024-2025 school year."
+    )
 
     col1, col2, col3, col4 = st.columns(4)
-
     with col1:
-        st.metric("Total Districts", len(districts_df))
+        st.metric("Districts", f"{len(districts_df):,}")
     with col2:
-        st.metric("Total Students", f"{districts_df['total_students'].sum():,}")
+        total = districts_df['total_students'].fillna(0).sum()
+        st.metric("Students (PK-12, 2024-25)", f"{int(total):,}")
     with col3:
-        st.metric("English Learners", f"{districts_df['ell_count'].sum():,}")
+        el = districts_df['el_count'].fillna(0).sum()
+        st.metric("English Learners", f"{int(el):,}")
     with col4:
-        avg_spf = districts_df['spf_score'].mean()
-        st.metric("Avg SPF Score", f"{avg_spf:.1f}")
+        pts = districts_df['spf_points'].dropna().mean()
+        # CDE stores DPF points earned as a decimal (0.527 = 52.7%). Display as percentage.
+        st.metric("Avg 2025 DPF % Earned", f"{pts * 100:.1f}%" if pd.notna(pts) else "n/a")
 
     st.divider()
-
-    st.subheader("Pilot Districts")
+    st.subheader("Districts")
 
     display_df = districts_df.copy()
-    display_df['ell_percent'] = display_df['ell_percent'].apply(lambda x: f"{x:.1f}%")
-    display_df['graduation_rate'] = display_df['graduation_rate'].apply(lambda x: f"{x:.1f}%")
-    display_df['spf_score'] = display_df['spf_score'].apply(lambda x: f"{x:.1f}")
-    display_df.columns = ['District ID', 'District Name', 'Total Students', 'EL Count', 'EL %', 'Grad Rate', 'SPF']
+    display_df["EL %"]       = display_df["el_percent"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+    display_df["Grad Rate"]  = display_df["graduation_rate"].map(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+    display_df["Students"]   = display_df["total_students"].map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+    display_df["EL Count"]   = display_df["el_count"].map(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+    display_df["DPF % Earned"] = display_df["spf_points"].map(lambda x: f"{x*100:.1f}%" if pd.notna(x) else "")
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    show = display_df[[
+        "district_id","district_name","region","Students","EL Count","EL %","Grad Rate",
+        "spf_rating","DPF % Earned"
+    ]].rename(columns={
+        "district_id":"District ID",
+        "district_name":"District",
+        "region":"Region",
+        "spf_rating":"2025 DPF Rating",
+    })
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
-    st.subheader("English Learner Population by District")
-
+    st.subheader("English Learner Population by District (top 30)")
+    top = districts_df.dropna(subset=["el_count"]).nlargest(30, "el_count")
     fig = px.bar(
-        districts_df.sort_values('ell_count', ascending=True),
-        x='ell_count',
-        y='district_name',
-        orientation='h',
-        color='ell_percent',
+        top.sort_values("el_count"),
+        x="el_count", y="district_name",
+        orientation="h",
+        color="el_percent",
         color_continuous_scale=[[0, CO_GOLD], [0.5, CO_BLUE], [1, CO_RED]],
-        labels={'ell_count': 'English Learners', 'district_name': 'District', 'ell_percent': 'EL %'}
+        labels={"el_count":"English Learners","district_name":"District","el_percent":"EL %"},
     )
-    fig.update_layout(height=400, showlegend=False)
+    fig.update_layout(height=650, showlegend=False, coloraxis_colorbar=dict(title="EL %"))
     st.plotly_chart(fig, use_container_width=True)
 
-def render_access_analysis(access_df, districts_df):
-    """Render ACCESS for ELLs assessment analysis."""
-    st.header("ACCESS for ELLs Analysis")
 
-    st.markdown("""
-    **ACCESS for ELLs** (WIDA) measures English learners' proficiency across four domains:
-    Listening, Speaking, Reading, and Writing. Colorado is a WIDA consortium member state.
-    """)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        district = st.selectbox(
-            "Select District",
-            options=districts_df['district_name'].tolist(),
-            key="access_district"
-        )
-
-    with col2:
-        grade = st.selectbox("Select Grade", options=list(range(3, 9)), key="access_grade")
-
-    with col3:
-        year = st.selectbox("Select Year", options=[2025, 2024], key="access_year")
-
-    district_id = districts_df[districts_df['district_name'] == district]['district_id'].values[0]
-
-    filtered = access_df[
-        (access_df['district_id'] == district_id) &
-        (access_df['grade'] == grade) &
-        (access_df['year'] == year)
-    ]
-
-    if not filtered.empty:
-        row = filtered.iloc[0]
-
-        st.divider()
-
-        st.subheader("ACCESS Domain Scores")
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Listening", f"{row['listening_avg']:.0f}")
-        with col2:
-            st.metric("Speaking", f"{row['speaking_avg']:.0f}")
-        with col3:
-            st.metric("Reading", f"{row['reading_avg']:.0f}")
-        with col4:
-            st.metric("Writing", f"{row['writing_avg']:.0f}")
-
-        domains = ['Listening', 'Speaking', 'Reading', 'Writing']
-        scores = [row['listening_avg'], row['speaking_avg'], row['reading_avg'], row['writing_avg']]
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=domains,
-            y=scores,
-            marker_color=[CO_BLUE, CO_RED, CO_GOLD, CO_BLUE],
-            text=[f"{s:.0f}" for s in scores],
-            textposition='outside'
-        ))
-        fig.update_layout(
-            title=f"ACCESS Domain Scores - {district} - Grade {grade} ({year})",
-            yaxis_title="Scale Score",
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        oral_avg = (row['listening_avg'] + row['speaking_avg']) / 2
-        written_avg = (row['reading_avg'] + row['writing_avg']) / 2
-        gap = oral_avg - written_avg
-
-        st.subheader("Oral vs Written Gap")
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Oral Average", f"{oral_avg:.0f}", help="(Listening + Speaking) / 2")
-        with col2:
-            st.metric("Written Average", f"{written_avg:.0f}", help="(Reading + Writing) / 2")
-        with col3:
-            delta_color = "normal" if gap < 25 else "inverse"
-            st.metric("Gap", f"{gap:+.0f}", delta=f"{'Flag' if gap > 30 else 'OK'}", delta_color=delta_color)
-
-def render_type4_detection(access_df, districts_df):
-    """Render Type 4 detection analysis."""
-    st.header("Type 4 Detection")
-
-    st.markdown("""
-    **Type 4 dyslexia candidates** demonstrate strong oral communication abilities but
-    significant challenges with written expression. VERA-CO identifies these students by
-    analyzing the delta between ACCESS Speaking and Writing domain scores.
-
-    **Flag Threshold:** Speaking - Writing delta > 8 points (normalized scale)
-    """)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        district = st.selectbox(
-            "Select District",
-            options=districts_df['district_name'].tolist(),
-            key="type4_district"
-        )
-
-    with col2:
-        grade = st.selectbox("Select Grade", options=list(range(3, 9)), key="type4_grade")
-
-    with col3:
-        year = st.selectbox("Select Year", options=[2025, 2024], key="type4_year")
-
-    district_id = districts_df[districts_df['district_name'] == district]['district_id'].values[0]
-
-    result = compute_type4_analysis(access_df, district_id, grade, year)
-
-    if result:
-        st.divider()
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Speaking Score", f"{result['speaking_avg']:.0f}")
-        with col2:
-            st.metric("Writing Score", f"{result['writing_avg']:.0f}")
-        with col3:
-            st.metric("Delta", f"{result['delta']:+.0f}")
-        with col4:
-            status = "🚨 FLAGGED" if result['flagged'] else "✅ OK"
-            st.metric("Status", status)
-
-        st.subheader("Oral-Written Delta Analysis")
-
-        fig = go.Figure()
-
-        fig.add_trace(go.Bar(
-            name='Speaking',
-            x=['Score'],
-            y=[result['speaking_avg']],
-            marker_color=CO_RED,
-            text=[f"{result['speaking_avg']:.0f}"],
-            textposition='outside'
-        ))
-
-        fig.add_trace(go.Bar(
-            name='Writing',
-            x=['Score'],
-            y=[result['writing_avg']],
-            marker_color=CO_BLUE,
-            text=[f"{result['writing_avg']:.0f}"],
-            textposition='outside'
-        ))
-
-        fig.update_layout(
-            title=f"Speaking vs Writing - {district} - Grade {grade}",
-            barmode='group',
-            height=350
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        if result['flagged']:
-            st.error(f"""
-            **Type 4 Flag Triggered**
-
-            This grade level shows a significant oral-written gap (delta: {result['delta']:+.0f}).
-
-            - **Estimated students affected:** {result['estimated_flagged']} of {result['total_tested']} tested
-            - **Recommended action:** Individual student-level screening for Type 4 dyslexia
-            - **Next steps:** Cross-reference with CMAS ELA writing performance
-            """)
-        else:
-            st.success(f"""
-            **No Type 4 Flag**
-
-            The oral-written gap for this grade level is within normal range (delta: {result['delta']:+.0f}).
-
-            - **Students tested:** {result['total_tested']}
-            - **Continue monitoring:** Regular ACCESS domain analysis recommended
-            """)
-
-        st.subheader(f"All Grades - {district} ({year})")
-
-        all_grades_data = []
-        for g in range(3, 9):
-            r = compute_type4_analysis(access_df, district_id, g, year)
-            if r:
-                all_grades_data.append(r)
-
-        if all_grades_data:
-            grades_df = pd.DataFrame(all_grades_data)
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=grades_df['grade'],
-                y=grades_df['speaking_avg'],
-                name='Speaking',
-                mode='lines+markers',
-                line=dict(color=CO_RED, width=3),
-                marker=dict(size=10)
-            ))
-            fig.add_trace(go.Scatter(
-                x=grades_df['grade'],
-                y=grades_df['writing_avg'],
-                name='Writing',
-                mode='lines+markers',
-                line=dict(color=CO_BLUE, width=3),
-                marker=dict(size=10)
-            ))
-
-            fig.update_layout(
-                title="Speaking vs Writing Across Grades",
-                xaxis_title="Grade",
-                yaxis_title="Scale Score",
-                height=400
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-def render_cmas_analysis(cmas_df, districts_df):
-    """Render CMAS assessment analysis."""
+def render_cmas_analysis(districts_df: pd.DataFrame):
     st.header("CMAS Assessment Analysis")
+    st.caption("Colorado Measures of Academic Success. Source: 2025 CMAS district+school overall results (CDE).")
 
     st.markdown("""
-    **CMAS (Colorado Measures of Academic Success)** measures student achievement
-    in English Language Arts and Mathematics aligned to Colorado Academic Standards.
+    **CMAS** measures student achievement in English Language Arts, Mathematics, and Science aligned to Colorado
+    Academic Standards. Five performance levels: Did Not Yet Meet, Partially Met, Approached, Met, Exceeded.
     """)
 
-    col1, col2, col3, col4 = st.columns(4)
-
+    col1, col2, col3 = st.columns(3)
     with col1:
-        district = st.selectbox(
-            "Select District",
-            options=districts_df['district_name'].tolist(),
-            key="cmas_district"
-        )
-
+        district_name = st.selectbox("District", options=districts_df["district_name"].tolist(), key="cmas_dist")
     with col2:
-        grade = st.selectbox("Select Grade", options=list(range(3, 9)), key="cmas_grade")
-
+        subject = st.selectbox("Subject",
+                               options=["English Language Arts","Mathematics","Science"],
+                               key="cmas_subj")
     with col3:
-        subject = st.selectbox("Select Subject", options=['ELA', 'Math'], key="cmas_subject")
+        grade = st.selectbox("Grade",
+                             options=["All Grades","03","04","05","06","07","08","11"],
+                             key="cmas_grade")
 
-    with col4:
-        year = st.selectbox("Select Year", options=[2025, 2024], key="cmas_year")
+    district_id = districts_df.loc[districts_df["district_name"] == district_name, "district_id"].values[0]
 
-    district_id = districts_df[districts_df['district_name'] == district]['district_id'].values[0]
+    df = load_cmas_row(district_id, subject, grade)
+    if df.empty:
+        st.warning(f"No CMAS data for {district_name} — {subject} — grade {grade}.")
+        return
 
-    filtered = cmas_df[
-        (cmas_df['district_id'] == district_id) &
-        (cmas_df['grade'] == grade) &
-        (cmas_df['subject'] == subject) &
-        (cmas_df['year'] == year)
-    ]
-
-    if not filtered.empty:
-        row = filtered.iloc[0]
-
-        st.divider()
-
-        st.subheader("Performance Distribution")
-
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Did Not Yet Meet", f"{row['not_met_pct']:.1f}%")
-        with col2:
-            st.metric("Approaching", f"{row['approaching_pct']:.1f}%")
-        with col3:
-            st.metric("Met", f"{row['met_pct']:.1f}%")
-        with col4:
-            st.metric("Exceeded", f"{row['exceeded_pct']:.1f}%")
-
-        levels = ['Did Not Yet\nMeet', 'Approaching', 'Met', 'Exceeded']
-        values = [row['not_met_pct'], row['approaching_pct'], row['met_pct'], row['exceeded_pct']]
-        colors = ['#d32f2f', '#f57c00', CO_GOLD, CO_BLUE]
-
-        fig = go.Figure(data=[
-            go.Bar(x=levels, y=values, marker_color=colors, text=[f"{v:.1f}%" for v in values], textposition='outside')
-        ])
-        fig.update_layout(
-            title=f"CMAS {subject} Performance - {district} - Grade {grade} ({year})",
-            yaxis_title="Percentage",
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        proficient_rate = row['met_pct'] + row['exceeded_pct']
-        st.metric(
-            "Proficiency Rate (Met + Exceeded)",
-            f"{proficient_rate:.1f}%",
-            help="Percentage of students meeting or exceeding expectations"
-        )
-
-def render_export(access_df, cmas_df, districts_df):
-    """Render data export page."""
-    st.header("Export Data")
-
-    st.markdown("Download assessment data for further analysis.")
-
-    district = st.selectbox(
-        "Select District (or All)",
-        options=["All Districts"] + districts_df['district_name'].tolist()
-    )
-
-    year = st.selectbox("Select Year", options=[2025, 2024])
+    row = df.iloc[0]
 
     st.divider()
+    st.subheader(f"{district_name} — {subject} — Grade {grade}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1: st.metric("Tested (valid scores)", f"{int(row['num_valid_scores']):,}" if pd.notna(row['num_valid_scores']) else "n/a")
+    with c2: st.metric("Mean Scale Score", f"{row['mean_scale_score']:.0f}" if pd.notna(row['mean_scale_score']) else "n/a")
+    with c3: st.metric("Participation", f"{row['participation_rate']:.1f}%" if pd.notna(row['participation_rate']) else "n/a")
+    with c4: st.metric("Met+Exceeded", f"{row['pct_met_or_exceeded']:.1f}%" if pd.notna(row['pct_met_or_exceeded']) else "n/a")
+
+    st.subheader("Performance Distribution")
+
+    is_science = (subject == "Science")
+    if is_science:
+        levels = ["Partially\nMet","Approached","Met","Exceeded"]
+        values = [row.get("pct_partially_met"), row.get("pct_approached"),
+                  row.get("pct_met"), row.get("pct_exceeded")]
+        colors = ["#f57c00", CO_GOLD, CO_BLUE, CO_RED]
+    else:
+        levels = ["Did Not\nYet Meet","Partially\nMet","Approached","Met","Exceeded"]
+        values = [row.get("pct_did_not_yet_meet"), row.get("pct_partially_met"),
+                  row.get("pct_approached"), row.get("pct_met"), row.get("pct_exceeded")]
+        colors = ["#d32f2f","#f57c00","#f9a825", CO_BLUE, CO_RED]
+
+    fig = go.Figure(data=[go.Bar(
+        x=levels, y=values,
+        marker_color=colors,
+        text=[f"{v:.1f}%" if pd.notna(v) else "n/a" for v in values],
+        textposition="outside"
+    )])
+    fig.update_layout(
+        title=f"CMAS {subject} — {district_name} — Grade {grade}",
+        yaxis_title="Percentage of Students",
+        height=420
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader(f"Across Grades — {subject}")
+    all_g = load_cmas_all_grades(district_id, subject)
+    if not all_g.empty:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=all_g["grade"], y=all_g["pct_met_or_exceeded"],
+            mode="lines+markers",
+            name="% Met or Exceeded",
+            line=dict(color=CO_BLUE, width=3),
+            marker=dict(size=10),
+        ))
+        fig2.update_layout(
+            yaxis_title="% Met + Exceeded",
+            xaxis_title="Grade",
+            height=380
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+def render_access_analysis(districts_df: pd.DataFrame):
+    st.header("ACCESS for ELLs Analysis")
+    st.caption("WIDA ACCESS proficiency levels. Source: CDE ACCESS for ELLs District and School Summary files.")
+
+    st.markdown("""
+    **ACCESS for ELLs** is Colorado's annual English language proficiency assessment for multilingual learners.
+    Six proficiency levels (1=Entering through 6=Reaching). Colorado is a WIDA consortium member state.
+    """)
+
+    st.info(
+        "**Data note:** District-level Level 1-6 percentages and redesignation eligibility rates are published by CDE. "
+        "Raw Speaking / Writing scale scores at the district level are not part of the public summary file — "
+        "those require a CDE aggregate data request."
+    )
 
     col1, col2 = st.columns(2)
-
     with col1:
-        st.subheader("ACCESS Data")
-        if district == "All Districts":
-            export_access = access_df[access_df['year'] == year]
-        else:
-            district_id = districts_df[districts_df['district_name'] == district]['district_id'].values[0]
-            export_access = access_df[(access_df['district_id'] == district_id) & (access_df['year'] == year)]
+        district_name = st.selectbox("District", options=districts_df["district_name"].tolist(), key="acc_dist")
+    district_id = districts_df.loc[districts_df["district_name"] == district_name, "district_id"].values[0]
 
-        st.dataframe(export_access, use_container_width=True, hide_index=True)
-
-        csv_access = export_access.to_csv(index=False)
-        st.download_button(
-            "Download ACCESS CSV",
-            csv_access,
-            f"vera_co_access_{year}.csv",
-            "text/csv",
-            use_container_width=True
-        )
-
+    years = available_access_years(district_id)
     with col2:
-        st.subheader("CMAS Data")
-        if district == "All Districts":
-            export_cmas = cmas_df[cmas_df['year'] == year]
-        else:
-            district_id = districts_df[districts_df['district_name'] == district]['district_id'].values[0]
-            export_cmas = cmas_df[(cmas_df['district_id'] == district_id) & (cmas_df['year'] == year)]
+        if not years:
+            st.warning(f"No ACCESS data available for {district_name}.")
+            return
+        year = st.selectbox("School year", options=years, key="acc_year")
 
-        st.dataframe(export_cmas, use_container_width=True, hide_index=True)
+    clusters = load_access_grade_clusters(district_id, year)
+    if not clusters:
+        st.warning(f"No grade clusters available for {district_name} in {year}.")
+        return
+    grade_cluster = st.selectbox("Grade cluster", options=clusters, key="acc_grade")
 
-        csv_cmas = export_cmas.to_csv(index=False)
-        st.download_button(
-            "Download CMAS CSV",
-            csv_cmas,
-            f"vera_co_cmas_{year}.csv",
-            "text/csv",
-            use_container_width=True
+    df = load_access_row(district_id, grade_cluster, year)
+    if df.empty:
+        st.warning("No matching ACCESS row.")
+        return
+    row = df.iloc[0]
+
+    st.divider()
+    st.subheader(f"{district_name} — {grade_cluster} — {year}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Number of Valid Scores", f"{int(row['num_valid_scores']):,}" if pd.notna(row['num_valid_scores']) else "n/a")
+    with c2: st.metric("Mean Scale Score", f"{row['mean_scale_score']:.0f}" if pd.notna(row['mean_scale_score']) else "n/a")
+    with c3: st.metric("Eligible for Redesignation", f"{row['pct_redesignation_eligible']:.1f}%" if pd.notna(row['pct_redesignation_eligible']) else "n/a")
+
+    st.subheader("WIDA Proficiency Level Distribution")
+    labels = ["Level 1\nEntering","Level 2\nEmerging","Level 3\nDeveloping",
+              "Level 4\nExpanding","Levels 5&6\nBridging/Reaching"]
+    values = [row.get("pct_level_1"), row.get("pct_level_2"),
+              row.get("pct_level_3"), row.get("pct_level_4"),
+              row.get("pct_level_5_6")]
+    colors = [CO_RED, "#f57c00","#f9a825", CO_BLUE, CO_GOLD]
+
+    fig = go.Figure(data=[go.Bar(
+        x=labels, y=values,
+        marker_color=colors,
+        text=[f"{v:.1f}%" if pd.notna(v) else "n/a" for v in values],
+        textposition="outside"
+    )])
+    fig.update_layout(
+        title=f"ACCESS Proficiency — {district_name} ({grade_cluster}, {year})",
+        yaxis_title="% of Students",
+        height=440
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_type4_detection(districts_df: pd.DataFrame):
+    st.header("Type 4 Gap Detection")
+
+    st.warning(
+        "**Methodology note (2026-07-08):** Full Type 4 detection as originally scoped requires district-level "
+        "ACCESS Speaking vs Writing scale scores, which CDE does not publish — that data requires a CDE aggregate "
+        "data request. The interim analysis below uses two proxies that ARE public: (a) CMAS ELA proficiency "
+        "compared for EL vs. non-EL students at the district level (from CMAS disaggregated files), and "
+        "(b) ACCESS proficiency level distribution. This complements — it does not replace — READ Act and MTSS screening."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        district_name = st.selectbox("District", options=districts_df["district_name"].tolist(), key="t4_dist")
+    with col2:
+        year = st.selectbox("School year", options=["2024-2025","2025-2026","2023-2024"], key="t4_year")
+    district_id = districts_df.loc[districts_df["district_name"] == district_name, "district_id"].values[0]
+
+    # Panel 1: CMAS ELA proficiency gap: EL vs non-EL
+    conn = get_conn()
+    q = """
+    SELECT subgroup_value, pct_met_or_exceeded, num_valid_scores
+    FROM cmas_disagg
+    WHERE district_code=? AND subject='ELA' AND subgroup_type='Language Proficiency'
+      AND grade='All Grades' AND UPPER(level)='DISTRICT'
+    """
+    ela_gap = pd.read_sql_query(q, conn, params=[district_id])
+
+    st.subheader("CMAS ELA Proficiency by Language Status (District Level)")
+    if ela_gap.empty:
+        st.info("No CMAS ELA disaggregated data available for this district.")
+    else:
+        fig = go.Figure(data=[go.Bar(
+            x=ela_gap["subgroup_value"],
+            y=ela_gap["pct_met_or_exceeded"],
+            marker_color=CO_BLUE,
+            text=[f"{v:.1f}%" if pd.notna(v) else "" for v in ela_gap["pct_met_or_exceeded"]],
+            textposition="outside"
+        )])
+        fig.update_layout(
+            title=f"CMAS ELA Met+Exceeded — {district_name} — 2025",
+            yaxis_title="% Met + Exceeded",
+            height=400
         )
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(ela_gap, use_container_width=True, hide_index=True)
+
+    # Panel 2: ACCESS Level distribution for the district
+    st.subheader("ACCESS Proficiency Distribution (from Panel 1 above, cross-referenced)")
+    q2 = """
+    SELECT grade_cluster, num_valid_scores,
+           pct_level_1, pct_level_2, pct_level_3, pct_level_4, pct_level_5_6,
+           pct_redesignation_eligible
+    FROM assessment_access_summary
+    WHERE level='DISTRICT' AND district_code=? AND school_year=?
+      AND grade_cluster='All Grades'
+    """
+    acc = pd.read_sql_query(q2, conn, params=[district_id, year])
+    if acc.empty:
+        st.info(f"No ACCESS data for {district_name} in {year}.")
+    else:
+        r = acc.iloc[0]
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        with c1: st.metric("EL Students Tested", f"{int(r['num_valid_scores']):,}" if pd.notna(r['num_valid_scores']) else "n/a")
+        with c2: st.metric("Level 1", f"{r['pct_level_1']:.1f}%" if pd.notna(r['pct_level_1']) else "n/a")
+        with c3: st.metric("Level 2", f"{r['pct_level_2']:.1f}%" if pd.notna(r['pct_level_2']) else "n/a")
+        with c4: st.metric("Level 3", f"{r['pct_level_3']:.1f}%" if pd.notna(r['pct_level_3']) else "n/a")
+        with c5: st.metric("Level 4+", f"{(r['pct_level_4'] or 0) + (r['pct_level_5_6'] or 0):.1f}%")
+        with c6: st.metric("Redesignation Eligible", f"{r['pct_redesignation_eligible']:.1f}%" if pd.notna(r['pct_redesignation_eligible']) else "n/a")
+
+    st.markdown("""
+    ---
+    **What this page currently shows (honest scope):**
+    - CMAS ELA proficiency gap between EL and non-EL students — a district-level pattern signal.
+    - ACCESS proficiency level distribution — the public equivalent of the oral/written gap analysis.
+
+    **What full Type 4 gap detection would require:**
+    - District-level ACCESS Speaking and Writing scale scores (available via CDE aggregate data request).
+    - Once available, VERA-CO would compute the Speaking − Writing delta per grade and district
+      and flag grade levels where the gap exceeds normal range.
+
+    **Important limits:**
+    - This is a district-level pattern signal, not an individual diagnosis.
+    - Not a substitute for READ Act screening or MTSS processes.
+    - Consult your district's SLP and multilingual services team for interpretation.
+    """)
+
+
+def render_export(districts_df: pd.DataFrame):
+    st.header("Export Data")
+    st.caption("Download real CDE public data for a district or the whole state.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        district = st.selectbox("District (or All)", options=["All Districts"] + districts_df["district_name"].tolist())
+    with col2:
+        dataset = st.selectbox("Dataset", options=[
+            "CMAS district results (all subjects/grades)",
+            "CMAS disaggregated (subgroups)",
+            "ACCESS summary (Levels 1-6)",
+            "Enrollment (IPST: EL/SPED/homeless/gifted)",
+            "Graduation rates",
+            "DPF district ratings",
+        ])
+
+    conn = get_conn()
+    where_district = ""
+    params = []
+    if district != "All Districts":
+        district_id = districts_df.loc[districts_df["district_name"] == district, "district_id"].values[0]
+        where_district = " AND district_code = ?"
+        params = [district_id]
+
+    if dataset.startswith("CMAS district"):
+        q = "SELECT * FROM cmas_district_school WHERE level='DISTRICT'" + where_district
+    elif dataset.startswith("CMAS disagg"):
+        q = "SELECT * FROM cmas_disagg WHERE UPPER(level)='DISTRICT'" + where_district
+    elif dataset.startswith("ACCESS"):
+        q = "SELECT * FROM assessment_access_summary WHERE level='DISTRICT'" + where_district
+    elif dataset.startswith("Enrollment"):
+        q = "SELECT * FROM enrollment_ipst_school WHERE 1=1" + where_district
+    elif dataset.startswith("Graduation"):
+        q = "SELECT * FROM outcomes_grad_district WHERE 1=1" + where_district
+    elif dataset.startswith("DPF"):
+        q = "SELECT * FROM dpf_district WHERE 1=1" + where_district
+    else:
+        st.error("Unknown dataset."); return
+
+    df = pd.read_sql_query(q, conn, params=params)
+    st.dataframe(df.head(500), use_container_width=True, hide_index=True)
+    st.caption(f"Showing first 500 of {len(df):,} rows. Download below for full CSV.")
+
+    csv = df.to_csv(index=False)
+    fname = dataset.split("(")[0].strip().lower().replace(" ", "_") + ".csv"
+    st.download_button(f"Download {fname}", csv, fname, "text/csv", use_container_width=True)
+
 
 # ============================================================================
-# MAIN APP
+# MAIN
 # ============================================================================
 
 def main():
     st.set_page_config(
-        page_title="VERA-CO | Colorado Type 4 Detection",
+        page_title="VERA-CO | Colorado Education Data",
         page_icon="🏔️",
-        layout="wide"
+        layout="wide",
     )
 
     st.markdown(f"""
     <style>
-        .stApp {{
-            background-color: #fafafa;
-        }}
-        .block-container {{
-            padding-top: 2rem;
-        }}
-        h1, h2, h3 {{
-            color: {CO_BLUE};
-        }}
-        .stButton > button {{
-            background-color: {CO_BLUE};
-            color: white;
-        }}
-        .stButton > button:hover {{
-            background-color: {CO_RED};
-            color: white;
-        }}
+        .stApp {{ background-color: #fafafa; }}
+        .block-container {{ padding-top: 2rem; }}
+        h1, h2, h3 {{ color: {CO_BLUE}; }}
+        .stButton > button {{ background-color: {CO_BLUE}; color: white; }}
+        .stButton > button:hover {{ background-color: {CO_RED}; color: white; }}
     </style>
     """, unsafe_allow_html=True)
 
-    districts_df = load_districts()
-    access_df = load_access_data()
-    cmas_df = load_cmas_data()
+    if not DB_PATH.exists():
+        st.error(f"Database not found at {DB_PATH}.")
+        st.stop()
 
+    # Sidebar
     st.sidebar.markdown(f"""
-    <div style="text-align: center; padding: 20px 0;">
-        <h2 style="color: {CO_BLUE}; margin: 0;">VERA-CO</h2>
-        <p style="color: #666; font-size: 0.85rem; margin-top: 5px;">Colorado Implementation</p>
+    <div style="text-align:center; padding:20px 0;">
+        <h2 style="color:{CO_BLUE}; margin:0;">VERA-CO</h2>
+        <p style="color:#666; font-size:0.85rem; margin-top:5px;">Colorado — Real CDE Data</p>
     </div>
     """, unsafe_allow_html=True)
-
     st.sidebar.divider()
 
     page = st.sidebar.radio(
         "Navigation",
-        ["Overview", "ACCESS Analysis", "Type 4 Detection", "CMAS Analysis", "Export Data"]
+        ["Overview", "CMAS Analysis", "ACCESS Analysis", "Type 4 Gap Detection", "Export Data"]
     )
-
     st.sidebar.divider()
+    st.sidebar.markdown(f"""
+    **Data sources:** Colorado Department of Education public files (CMAS, ACCESS for ELLs, DPF/SPF, IPST, Graduation).
 
-    st.sidebar.markdown("""
-    **Data Sources:**
-    - ACCESS for ELLs (WIDA)
-    - CMAS (Colorado Academic Success)
-    - School Performance Framework
-
-    **Type 4 Detection:**
-    - Speaking vs Writing delta
-    - Flag threshold: > 8 points
-
-    ---
+    **Coverage:** 184 districts · 1,833 schools · 2019-2026 depending on file.
 
     [H-EDU.Solutions](https://h-edu.solutions)
     """)
 
+    districts_df = load_districts()
+
     if page == "Overview":
-        render_overview(districts_df, access_df, cmas_df)
-    elif page == "ACCESS Analysis":
-        render_access_analysis(access_df, districts_df)
-    elif page == "Type 4 Detection":
-        render_type4_detection(access_df, districts_df)
+        render_overview(districts_df)
     elif page == "CMAS Analysis":
-        render_cmas_analysis(cmas_df, districts_df)
+        render_cmas_analysis(districts_df)
+    elif page == "ACCESS Analysis":
+        render_access_analysis(districts_df)
+    elif page == "Type 4 Gap Detection":
+        render_type4_detection(districts_df)
     elif page == "Export Data":
-        render_export(access_df, cmas_df, districts_df)
+        render_export(districts_df)
+
 
 if __name__ == "__main__":
     main()
