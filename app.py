@@ -224,12 +224,12 @@ def render_overview(districts_df: pd.DataFrame):
     st.header("Colorado Education Overview")
     st.caption(
         "Data source: Colorado Department of Education public files (CMAS, DPF, IPST, graduation). "
-        "184 districts, 2024-2025 school year."
+        "178 school districts (184 CDE-reporting entities including the Charter School Institute, BOCES, and administrative units), 2024-2025 school year."
     )
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Districts", f"{len(districts_df):,}")
+        st.metric("CDE entities (178 districts + BOCES/CSI)", f"{len(districts_df):,}")
     with col2:
         total = districts_df['total_students'].fillna(0).sum()
         st.metric("Students (PK-12, 2024-25)", f"{int(total):,}")
@@ -609,7 +609,7 @@ def main():
     st.sidebar.markdown(f"""
     **Data sources:** Colorado Department of Education public files (CMAS, ACCESS for ELLs, DPF/SPF, IPST, Graduation).
 
-    **Coverage:** 184 districts · 1,833 schools · 2019-2026 depending on file.
+    **Coverage:** 178 districts + BOCES/CSI (184 CDE entities) · 1,833 schools · 2019-2026 depending on file.
 
     [H-EDU.Solutions](https://h-edu.solutions)
     """)
